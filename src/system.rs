@@ -17,10 +17,10 @@ pub trait System {
 /// # use simp12_rs::cpu::*;
 /// # use simp12_rs::param::*;
 /// # let cpu = Cpu::default();
-/// # fn first_system(_: R<Pc>) {}
-/// # fn second_system(_: R<Pc>) {}
-/// # fn third_system(_: R<Pc>) {}
-/// # fn fourth_system(_: R<Pc>) {}
+/// # fn first_system(_: B<Pc>) {}
+/// # fn second_system(_: B<Pc>) {}
+/// # fn third_system(_: B<Pc>) {}
+/// # fn fourth_system(_: B<Pc>) {}
 /// cpu.run(
 ///     (
 ///         first_system,
@@ -151,24 +151,22 @@ impl_system_set!(
 
 #[cfg(test)]
 mod test {
-    use crate::{
-        cpu::{Cpu, Pc},
-        param::{R, W},
-    };
+    use crate::cpu::{Cpu, Pc};
+    use std::cell::{Ref, RefMut};
 
-    fn inc(mut pc: W<Pc>) {
+    fn inc(mut pc: RefMut<Pc>) {
         pc.0 += 1;
     }
 
     #[test]
     fn system() {
         let cpu = Cpu::default();
-        cpu.run((inc, |pc: R<Pc>| {
+        cpu.run((inc, |pc: Ref<Pc>| {
             assert_eq!(pc.0, 1);
         }));
 
         let cpu = Cpu::default();
-        cpu.run((inc, inc, |pc: R<Pc>| {
+        cpu.run((inc, inc, |pc: Ref<Pc>| {
             assert_eq!(pc.0, 2);
         }));
     }

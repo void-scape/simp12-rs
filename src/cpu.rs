@@ -1,20 +1,21 @@
 use crate::{
-    param::W,
+    control::ControlFlags,
+    param::{Command, Signal},
     system::SystemSet,
     word::{Word, word},
 };
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::HashMap};
 
 macro_rules! cpu {
     {
         $(#[$attrs:meta])*
         pub struct $ident:ident {
-            $($field:ident: $field_ty:tt,)*
+            $($field:ident: $field_ty:ty,)*
         }
     } => {
         $(#[$attrs])*
         pub struct $ident {
-            $($field: RefCell<$field_ty>,)*
+            $(pub $field: RefCell<$field_ty>,)*
         }
         $(crate::impl_system_param!($field_ty, $field);)*
     };
@@ -27,18 +28,21 @@ cpu! {
     /// ```
     /// # use simp12_rs::cpu::*;
     /// # use simp12_rs::param::*;
-    /// fn instruction_fetch(mut mem: W<Mem>, mut pc: W<Pc>, pcmux: R<PcMux>) {
-    ///     mem.addr(pc.0);
+    /// # use simp12_rs::word::*;
+    /// # use core::cell::{RefMut, Ref};
+    /// fn instruction_fetch(mut mem: RefMut<Mem>, mut pc: RefMut<Pc>, pcmux: Ref<PcMux>) {
+    ///     mem.write(pc.0, word(42));
     ///     pc.0 = pcmux.read();
     /// }
     /// # let cpu = Cpu::default();
     ///
     /// cpu.run(instruction_fetch);
     /// ```
-    #[derive(Debug, Default)]
+    #[derive(Default)]
     pub struct Cpu {
         cycles: Cycles,
         //
+        signals: Signals,
         memory: Mem,
         pc: Pc,
         pcaddr: PcAdder,
@@ -49,6 +53,8 @@ cpu! {
         ifdel: IfDeLatch,
         deexl: DeExLatch,
         exmeml: ExMemLatch,
+        //
+        commands: Vec<Command>,
     }
 }
 
@@ -59,10 +65,7 @@ impl Cpu {
         assert!(memory.len() <= 256);
         mem[..memory.len()].copy_from_slice(memory);
         Self {
-            memory: RefCell::new(Mem {
-                memory: mem,
-                active_addr: 0,
-            }),
+            memory: RefCell::new(Mem(mem)),
             ..Default::default()
         }
     }
@@ -81,23 +84,30 @@ impl Cpu {
 #[derive(Debug, Default)]
 pub struct Cycles(pub usize);
 
-pub fn incr_cycles(mut cycles: W<Cycles>) {
-    cycles.0 += 1;
+impl Cycles {
+    pub fn incr(&mut self) {
+        self.0 += 1;
+    }
 }
+
+pub fn finish_cycle(cpu: &Cpu) {
+    cpu.cycles.borrow_mut().incr();
+    for mut command in cpu.commands.borrow_mut().drain(..) {
+        command(cpu);
+    }
+}
+
+/// Dynamic collection of [`Signal`]s associated with a type name.
+#[derive(Debug, Default)]
+pub struct Signals(pub HashMap<&'static str, RefCell<Signal>>);
 
 /// 8-bit addressable memory.
 #[derive(Debug)]
-pub struct Mem {
-    memory: [Word; 256],
-    active_addr: usize,
-}
+pub struct Mem([Word; 256]);
 
 impl Default for Mem {
     fn default() -> Self {
-        Self {
-            memory: [Word::default(); 256],
-            active_addr: 0,
-        }
+        Self([Word::default(); 256])
     }
 }
 
@@ -105,25 +115,20 @@ impl Mem {
     pub const LOAD: u8 = 0b0100;
     pub const STORE: u8 = 0b0101;
 
-    /// Set the memories active address to `addr`.
-    pub fn addr(&mut self, addr: u8) {
-        self.active_addr = addr as usize;
+    /// Read a [`Word`] from `addr`.
+    pub fn read(&mut self, addr: u8) -> Word {
+        self.0[addr as usize]
     }
 
-    /// Read a [`Word`] from the active address.
-    pub fn read(&self) -> Word {
-        self.memory[self.active_addr]
-    }
-
-    /// Write `word` to the active address.
-    pub fn write(&mut self, word: Word) {
-        self.memory[self.active_addr] = word;
+    /// Write `word` to `addr`.
+    pub fn write(&mut self, addr: u8, word: Word) {
+        self.0[addr as usize] = word;
     }
 
     /// Well formatted string for debugging.
     pub fn pretty_fmt(&self) -> String {
         let mut str = String::new();
-        for (i, slice) in self.memory.chunks(4).enumerate() {
+        for (i, slice) in self.0.chunks(4).enumerate() {
             str.push_str(&format!("{:#06X}\t", i));
             for word in slice.iter() {
                 str.push_str(&format!("{:#08X} ", word.into_inner()));
@@ -161,7 +166,7 @@ pub struct Acc(pub Word);
 
 /// Arithmetic logic unit.
 #[derive(Debug, Default)]
-pub struct Alu(Word);
+pub struct Alu;
 
 impl Alu {
     pub const AND: u8 = 0b1000;
@@ -169,73 +174,102 @@ impl Alu {
     pub const ADD: u8 = 0b1010;
     pub const SUB: u8 = 0b1011;
 
-    pub fn read(&self) -> Word {
-        self.0
-    }
-
-    pub fn write(&mut self, acc: Word, mx: Word, func_sel: u8) {
+    pub fn process(&mut self, acc: Word, mx: Word, func_sel: u8) -> Word {
         match func_sel {
-            Alu::AND => {
-                self.0 = word(acc.into_inner() & mx.into_inner());
-            }
-            Alu::OR => {
-                self.0 = word(acc.into_inner() | mx.into_inner());
-            }
-            Alu::ADD => {
-                self.0 = acc.wrapping_add(mx);
-            }
-            Alu::SUB => {
-                self.0 = acc.wrapping_sub(mx);
-            }
+            Alu::AND => word(acc.into_inner() & mx.into_inner()),
+            Alu::OR => word(acc.into_inner() | mx.into_inner()),
+            Alu::ADD => acc.wrapping_add(mx),
+            Alu::SUB => acc.wrapping_sub(mx),
             _ => {
                 // If the opcode does not correspond to an ALU function, just
                 // write 0 to the output.
-                self.0 = word(0);
+                word(0)
             }
         }
     }
 }
 
-#[derive(Debug, Default)]
+/// Initialization value for latch IRs that does not correspond to a valid opcode.
+/// This prevents the decode, execute, and memory stages from stalling due to zero
+/// being the JMP opcode.
+const INIT_IR: u8 = 0b1101;
+
+#[derive(Debug)]
 pub struct IfDeLatch {
     pub ir: u8,
     pub mar: u8,
+    pub control: ControlFlags,
 }
 
-#[derive(Debug, Default)]
+impl Default for IfDeLatch {
+    fn default() -> Self {
+        Self {
+            ir: INIT_IR,
+            mar: 0,
+            control: ControlFlags::NONE,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct DeExLatch {
     pub ir: u8,
     pub mar: u8,
     pub mdr: Word,
+    pub control: ControlFlags,
 }
 
-#[derive(Debug, Default)]
+impl Default for DeExLatch {
+    fn default() -> Self {
+        Self {
+            ir: INIT_IR,
+            mar: 0,
+            mdr: word(0),
+            control: ControlFlags::NONE,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct ExMemLatch {
     pub ir: u8,
     pub mar: u8,
     pub mdr: Word,
     pub alu_result: Word,
+    pub control: ControlFlags,
+}
+
+impl Default for ExMemLatch {
+    fn default() -> Self {
+        Self {
+            ir: INIT_IR,
+            mar: 0,
+            mdr: word(0),
+            alu_result: word(0),
+            control: ControlFlags::NONE,
+        }
+    }
 }
 
 /// Multiplexer used to determine what value to set the [`Pc`].
 #[derive(Debug)]
 pub struct PcMux {
+    pub pc_incr: u8,
     ir: u8,
     a: Word,
     mar: u8,
-    pc_incr: u8,
 }
 
 impl Default for PcMux {
     fn default() -> Self {
         Self {
+            pc_incr: 0,
             // Initialize to an `ir` value that will automatically choose `pc_incr`.
             // This way, when the program starts, `PcMux` will correctly advance the
             // `Pc`.
             ir: 0xFF,
             a: word(0),
             mar: 0,
-            pc_incr: 0,
         }
     }
 }
@@ -271,10 +305,9 @@ impl PcMux {
     }
 
     /// Write to the [`PcMux`].
-    pub fn write(&mut self, ir: u8, a: Word, mar: u8, pc_incr: u8) {
+    pub fn write(&mut self, ir: u8, a: Word, mar: u8) {
         self.ir = ir;
         self.a = a;
         self.mar = mar;
-        self.pc_incr = pc_incr;
     }
 }

@@ -1,90 +1,189 @@
 use simp12_rs::{
+    control::ControlFlags,
     cpu::{self, Acc, Alu, Cpu, Cycles, DeExLatch, ExMemLatch, IfDeLatch, Mem, Pc, PcAdder, PcMux},
-    param::{R, W},
+    param::{B, S, Signal},
     word::{Word, word},
 };
+use std::cell::{Ref, RefMut};
 
-fn instruction_fetch(mut mem: W<Mem>, mut pc: W<Pc>, pcmux: R<PcMux>) {
-    let pre_pc = pc.0;
-    pc.0 = pcmux.read();
-    mem.addr(pc.0);
-    let post_pc = pc.0;
-    let diff = post_pc as i32 - pre_pc as i32;
-    println!("[IF] PC + {diff} = {:#X}", pc.0);
-}
+struct Stall;
 
-fn ifdel(mut latch: W<IfDeLatch>, mem: R<Mem>) {
-    let instr = mem.read();
-    latch.ir = instr.high_nibble();
-    latch.mar = instr.truncate();
-
-    let instr_label = match latch.ir {
-        PcMux::JMP => "JMP",
-        PcMux::JN => "JN",
-        PcMux::JZ => "JZ",
-        Alu::OR => "OR",
-        Alu::AND => "AND",
-        Alu::ADD => "ADD",
-        Alu::SUB => "SUB",
-        Mem::LOAD => "LOAD",
-        Mem::STORE => "STORE",
-        0b1111 => "HALT",
-        _ => unreachable!(),
-    };
-    println!("[IF] {instr_label}\t:{:#06X}", latch.mar);
-}
-
-fn decode(mut mem: W<Mem>, latch: R<IfDeLatch>) {
-    mem.addr(latch.mar);
-}
-
-fn deexl(mut latch: W<DeExLatch>, ifdel: R<IfDeLatch>, mem: R<Mem>) {
-    latch.ir = ifdel.ir;
-    latch.mar = ifdel.mar;
-    // TODO: Need some way to know if there are concurrent read/writes.
-    latch.mdr = mem.read();
-    println!("[DE] MDR:{:#08X}", latch.mdr.into_inner());
-}
-
-fn execute(mut alu: W<Alu>, deexl: R<DeExLatch>, acc: R<Acc>) {
-    let acc = acc.0;
-    let mx = deexl.mdr;
-    let func_sel = deexl.ir;
-    alu.write(acc, mx, func_sel);
-}
-
-fn exmeml(mut latch: W<ExMemLatch>, deexl: R<DeExLatch>, alu: R<Alu>) {
-    latch.ir = deexl.ir;
-    latch.mar = deexl.mar;
-    latch.mdr = deexl.mdr;
-    latch.alu_result = alu.read();
-}
-
-fn memory(
-    mut mem: W<Mem>,
-    mut acc: W<Acc>,
-    mut pcmux: W<PcMux>,
-    mut pcaddr: W<PcAdder>,
-    latch: R<ExMemLatch>,
-    pc: R<Pc>,
+fn mem(
+    mut mem: RefMut<Mem>,
+    mut ifdel: B<IfDeLatch>,
+    mut deexl: B<DeExLatch>,
+    mut stall: S<Stall>,
+    exmeml: Ref<ExMemLatch>,
+    pc: Ref<Pc>,
+    acc: Ref<Acc>,
 ) {
-    // write all the shit to the pc multiplexer
-    pcmux.write(latch.ir, acc.0, latch.mar, pcaddr.add_pc(pc.0));
+    *stall = Signal::Low;
 
-    mem.addr(latch.mar);
-    match latch.ir {
-        Mem::LOAD => {
-            acc.0 = mem.read();
-        }
-        Mem::STORE => {
-            mem.write(acc.0);
-        }
-        Alu::AND | Alu::OR | Alu::ADD | Alu::SUB => {
-            acc.0 = latch.alu_result;
-        }
-        _ => {
-            // Jump instructions are handled by the mux
-        }
+    let mem_read_de = ifdel.control.mem_read_de();
+    let mem_write = exmeml.control.mem_write();
+
+    let mem_read_if = !mem_write && !mem_read_de;
+
+    assert!(!(mem_read_if && mem_read_de));
+    assert!(!mem_write || !mem_read_de && !mem_read_if);
+
+    let mem_sel = ifdel.control.mem_read_de();
+    let read_addr = if !mem_sel { pc.0 } else { ifdel.mar };
+
+    let word = mem.read(read_addr);
+    let control = match word.high_nibble() {
+        Alu::ADD | Alu::SUB | Alu::AND | Alu::OR => ControlFlags::MATH,
+        Mem::STORE => ControlFlags::STORE,
+        Mem::LOAD => ControlFlags::LOAD,
+        PcMux::JMP | PcMux::JN | PcMux::JZ => ControlFlags::JMP,
+        _ => ControlFlags::NONE,
+    };
+
+    if mem_read_if
+        && !control.hazard(ifdel.control)
+        && !control.hazard(deexl.control)
+        && !control.hazard(exmeml.control)
+    {
+        ifdel.buffered_write(move |ifdel| {
+            ifdel.control = control & ControlFlags::DECODE_FLAGS;
+            ifdel.ir = word.high_nibble();
+            ifdel.mar = word.truncate();
+        });
+    } else {
+        *stall = Signal::High;
+        ifdel.buffered_write(move |ifdel| {
+            ifdel.control = ControlFlags::NONE;
+        });
+    }
+
+    if mem_read_de {
+        let word = mem.read(read_addr);
+        deexl.buffered_write(move |deexl| {
+            deexl.mdr = word;
+        });
+    }
+
+    if mem_write {
+        let write_addr = exmeml.mar;
+        mem.write(write_addr, acc.0);
+    }
+}
+
+fn deexl(mut deexl: B<DeExLatch>, ifdel: Ref<IfDeLatch>) {
+    let ir = ifdel.ir;
+    let mar = ifdel.mar;
+    let control = ifdel.control;
+    deexl.buffered_write(move |deexl| {
+        deexl.ir = ir;
+        deexl.mar = mar;
+        deexl.control = control & ControlFlags::EXECUTE_FLAGS;
+    });
+}
+
+fn execute(mut alu: RefMut<Alu>, mut exmeml: B<ExMemLatch>, acc: Ref<Acc>, deexl: Ref<DeExLatch>) {
+    let ir = deexl.ir;
+    let mar = deexl.mar;
+    let mdr = deexl.mdr;
+    let control = deexl.control;
+    let alu_result = alu.process(acc.0, deexl.mdr, deexl.ir);
+
+    exmeml.buffered_write(move |exmeml| {
+        exmeml.ir = ir;
+        exmeml.mar = mar;
+        exmeml.mdr = mdr;
+        exmeml.control = control & ControlFlags::MEM_FLAGS;
+        exmeml.alu_result = alu_result;
+    });
+}
+
+fn pcmux(mut pcmux: RefMut<PcMux>, exmeml: Ref<ExMemLatch>, acc: Ref<Acc>) {
+    let ir = exmeml.ir;
+    let mar = exmeml.mar;
+    let acc = acc.0;
+    pcmux.write(ir, acc, mar);
+}
+
+fn pc(
+    mut pc: B<Pc>,
+    mut pcadder: RefMut<PcAdder>,
+    mut pcmux: RefMut<PcMux>,
+    exmeml: Ref<ExMemLatch>,
+    stall: S<Stall>,
+) {
+    let pcincr = pcadder.add_pc(pc.0);
+    pcmux.pc_incr = pc.0;
+    let pcmux_val = pcmux.read();
+    let pc_sel = exmeml.control.pc_sel();
+    let next_pc = if !pc_sel { pcincr } else { pcmux_val };
+
+    if pc_sel {
+        pc.buffered_write(move |pc| {
+            pc.0 = next_pc;
+        });
+    } else if stall.is_low() {
+        pc.buffered_write(move |pc| {
+            pc.0 = next_pc;
+        });
+    }
+}
+
+fn acc(mut acc: B<Acc>, exmeml: Ref<ExMemLatch>) {
+    if exmeml.control.acc_write() {
+        let alu_result = exmeml.alu_result;
+        let mx = exmeml.mdr;
+        let select_alu = !exmeml.control.a_sel();
+        let new_acc = if select_alu { alu_result } else { mx };
+        acc.buffered_write(move |acc| {
+            acc.0 = new_acc;
+        });
+    }
+}
+
+fn debug(
+    pc: Ref<Pc>,
+    acc: Ref<Acc>,
+    ifdel: Ref<IfDeLatch>,
+    deexl: Ref<DeExLatch>,
+    exmeml: Ref<ExMemLatch>,
+    mut mem: RefMut<Mem>,
+) {
+    println!("[PC] {:#08X}", pc.0);
+    println!("[AC] {:#08X}", acc.0.into_inner());
+    debug_ir("IF", mem.read(pc.0).high_nibble(), false);
+
+    if ifdel.control != ControlFlags::NONE {
+        debug_ir("IF/DE", ifdel.ir, ifdel.control == ControlFlags::NONE);
+        println!("{:#?}", &*ifdel);
+    }
+    if deexl.control != ControlFlags::NONE {
+        debug_ir("DE/EX", deexl.ir, deexl.control == ControlFlags::NONE);
+        println!("{:#?}", &*deexl);
+    }
+    if exmeml.control != ControlFlags::NONE {
+        debug_ir("EX/MEM", exmeml.ir, exmeml.control == ControlFlags::NONE);
+        println!("{:#?}", &*exmeml);
+    }
+    println!();
+}
+
+fn debug_ir(stage: &'static str, ir: u8, stall: bool) {
+    if stall {
+        println!("[{stage}] STALL");
+    } else {
+        let instr_label = match ir {
+            PcMux::JMP => "JMP",
+            PcMux::JN => "JN",
+            PcMux::JZ => "JZ",
+            Alu::OR => "OR",
+            Alu::AND => "AND",
+            Alu::ADD => "ADD",
+            Alu::SUB => "SUB",
+            Mem::LOAD => "LOAD",
+            Mem::STORE => "STORE",
+            0b1111 => "HALT",
+            _ => "INVALID",
+        };
+        println!("[{stage}] {instr_label}");
     }
 }
 
@@ -114,12 +213,8 @@ fn main() {
     // init both integers
     let a = 4;
     let b = 3;
-    cpu.run(|mut mem: W<Mem>| {
-        mem.addr(0xFE);
-        mem.write(word(a));
-        mem.addr(0xFD);
-        mem.write(word(b));
-    });
+    cpu.memory.borrow_mut().write(0xFE, word(a));
+    cpu.memory.borrow_mut().write(0xFD, word(b));
 
     fn simulated_mult(a: Word, b: Word) -> Word {
         let mut result = word(0);
@@ -130,12 +225,11 @@ fn main() {
     }
 
     const HALT: u8 = 0b1111;
-    let check_halt = move |latch: R<IfDeLatch>, mut mem: W<Mem>, cycles: R<Cycles>| {
+    let check_halt = move |latch: Ref<IfDeLatch>, mut mem: RefMut<Mem>, cycles: Ref<Cycles>| {
         if latch.ir == HALT {
             println!("{}", mem.pretty_fmt());
             println!("Cycles: {}", cycles.0);
-            mem.addr(0xFF);
-            let result = mem.read();
+            let result = mem.read(0xFF);
             // make sure the program did what we want
             assert_eq!(result, simulated_mult(word(a), word(b)));
             std::process::exit(0);
@@ -144,10 +238,13 @@ fn main() {
 
     loop {
         cpu.run((
-            (instruction_fetch, ifdel, cpu::incr_cycles),
-            (check_halt, decode, deexl, cpu::incr_cycles),
-            (execute, exmeml, cpu::incr_cycles),
-            (memory, cpu::incr_cycles),
+            mem,
+            deexl,
+            execute,
+            pcmux,
+            pc,
+            acc,
+            (check_halt, debug, cpu::finish_cycle),
         ));
     }
 }

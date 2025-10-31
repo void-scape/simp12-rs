@@ -1,3 +1,4 @@
+pub mod control;
 pub mod cpu;
 pub mod param;
 pub mod system;
