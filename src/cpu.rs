@@ -1,4 +1,5 @@
 use crate::{
+    assembler::MachineCode,
     control::ControlFlags,
     param::{Command, Signal},
     system::SystemSet,
@@ -59,8 +60,18 @@ cpu! {
 }
 
 impl Cpu {
+    /// Create a [`Cpu`] initialized with [`MachineCode`].
+    pub fn new(machine_code: MachineCode) -> Self {
+        Self {
+            memory: RefCell::new(Mem(machine_code.program)),
+            pc: RefCell::new(Pc(machine_code.pc)),
+            acc: RefCell::new(Acc(machine_code.acc)),
+            ..Default::default()
+        }
+    }
+
     /// Create a [`Cpu`] initialized with `memory`.
-    pub fn new(memory: &[Word]) -> Self {
+    pub fn from_memory(memory: &[Word]) -> Self {
         let mut mem = [word(0); 256];
         assert!(memory.len() <= 256);
         mem[..memory.len()].copy_from_slice(memory);

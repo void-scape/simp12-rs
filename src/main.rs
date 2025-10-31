@@ -1,10 +1,60 @@
 use simp12_rs::{
+    assembler,
     control::ControlFlags,
     cpu::{self, Acc, Alu, Cpu, Cycles, DeExLatch, ExMemLatch, IfDeLatch, Mem, Pc, PcAdder, PcMux},
     param::{B, S, Signal},
     word::{Word, word},
 };
 use std::cell::{Ref, RefMut};
+
+fn main() {
+    // let bytes = include_bytes!("mult2int.txt");
+    // let machine_code = assembler::memory_file(bytes.as_slice()).unwrap();
+    let str = include_str!("mult2int.asm");
+    let machine_code = assembler::assemble(str).unwrap();
+    let cpu = Cpu::new(machine_code);
+
+    // init both integers
+    let a = 4;
+    let b = 3;
+    {
+        let mut mem = cpu.memory.borrow_mut();
+        mem.write(0xFE, word(a));
+        mem.write(0xFD, word(b));
+    }
+
+    fn simulated_mult(a: Word, b: Word) -> Word {
+        let mut result = word(0);
+        for _ in 0..b.into_inner() {
+            result = result.wrapping_add(a);
+        }
+        result
+    }
+
+    const HALT: u8 = 0b1111;
+    let check_halt = move |latch: Ref<IfDeLatch>, mut mem: RefMut<Mem>, cycles: Ref<Cycles>| {
+        if latch.ir == HALT {
+            println!("{}", mem.pretty_fmt());
+            println!("Cycles: {}", cycles.0);
+            let result = mem.read(0xFF);
+            // make sure the program did what we want
+            assert_eq!(result, simulated_mult(word(a), word(b)));
+            std::process::exit(0);
+        }
+    };
+
+    loop {
+        cpu.run((
+            mem,
+            deexl,
+            execute,
+            pcmux,
+            pc,
+            acc,
+            (check_halt, debug, cpu::finish_cycle),
+        ));
+    }
+}
 
 struct Stall;
 
@@ -184,67 +234,5 @@ fn debug_ir(stage: &'static str, ir: u8, stall: bool) {
             _ => "INVALID",
         };
         println!("[{stage}] {instr_label}");
-    }
-}
-
-// Pierre's S12 memFile: https://github.com/void-scape/simp12/blob/main/bench/mult-2int-mem.memFile
-//
-// This program takes 169 cycles to multiply 4 and 3 WITHOUT pipelining. I think
-// with reasonable pipelineing this can be brought down to around 40-45.
-const MULT_2INT: &[Word] = &[
-    word(0b000000000001),
-    word(0b010011100010),
-    word(0b101111100010),
-    word(0b010111111111),
-    word(0b010011111110),
-    word(0b001000001101),
-    word(0b010011111111),
-    word(0b101011111101),
-    word(0b010111111111),
-    word(0b010011111110),
-    word(0b101100000000),
-    word(0b010111111110),
-    word(0b000000000100),
-    word(0b111100000000),
-];
-
-fn main() {
-    let cpu = Cpu::new(MULT_2INT);
-    // init both integers
-    let a = 4;
-    let b = 3;
-    cpu.memory.borrow_mut().write(0xFE, word(a));
-    cpu.memory.borrow_mut().write(0xFD, word(b));
-
-    fn simulated_mult(a: Word, b: Word) -> Word {
-        let mut result = word(0);
-        for _ in 0..b.into_inner() {
-            result = result.wrapping_add(a);
-        }
-        result
-    }
-
-    const HALT: u8 = 0b1111;
-    let check_halt = move |latch: Ref<IfDeLatch>, mut mem: RefMut<Mem>, cycles: Ref<Cycles>| {
-        if latch.ir == HALT {
-            println!("{}", mem.pretty_fmt());
-            println!("Cycles: {}", cycles.0);
-            let result = mem.read(0xFF);
-            // make sure the program did what we want
-            assert_eq!(result, simulated_mult(word(a), word(b)));
-            std::process::exit(0);
-        }
-    };
-
-    loop {
-        cpu.run((
-            mem,
-            deexl,
-            execute,
-            pcmux,
-            pc,
-            acc,
-            (check_halt, debug, cpu::finish_cycle),
-        ));
     }
 }
