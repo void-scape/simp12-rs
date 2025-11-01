@@ -2,6 +2,7 @@ use crate::{
     cpu::{Alu, Mem, PcMux},
     word::Word,
 };
+use std::collections::HashMap;
 
 /// The values used to initialize a [`Cpu`] with a program.
 ///
@@ -52,25 +53,25 @@ pub enum Error {
 /// ## Example
 /// ```toml
 ///     JMP ZERO_RESULT
-/// 
+///
 /// ZERO_RESULT:
 ///     LOAD E2     
 ///     SUB E2  
 ///     STORE FF
-/// 
+///
 /// ADD_MULT_TO_RESULT:
 ///     LOAD FE     
 ///     JZ DONE    
 ///     
 ///     LOAD FF    
 ///     ADD FD    
-///     STORE FF 
+///     STORE FF
 ///     
-///     LOAD FE 
+///     LOAD FE
 ///     SUB 00  
-///     STORE FE 
+///     STORE FE
 ///     JMP ADD_MULT_TO_RESULT
-/// 
+///
 /// DONE:
 ///     HALT
 /// ```
@@ -138,7 +139,7 @@ pub fn assemble(mut str: &str) -> Result<MachineCode> {
     Ok(machine_code)
 }
 
-#[derive(Debug)]
+#[derive(PartialEq, Eq, Hash)]
 struct Label(String);
 
 fn label(input: &mut &str) -> Result<Label> {
@@ -167,7 +168,7 @@ fn label_str(input: &mut &str) -> Result<Label> {
     }
 }
 
-#[derive(Debug)]
+#[derive(PartialEq, Eq, Hash)]
 enum Instr {
     Jmp(Label),
     Jz(Label),
@@ -339,6 +340,63 @@ fn aeat_whitespace(input: &mut &[u8]) -> Result<()> {
         *input = &input[1..];
     }
     Ok(())
+}
+
+pub struct MachineCodeStatistics {
+    pub instr_mix: String,
+    pub number_of_instructions: usize,
+}
+
+/// Parse a memory file and report machine code statistics.
+pub fn memory_file_statistics(mut bytes: &[u8]) -> Result<MachineCodeStatistics> {
+    let input = &mut bytes;
+    let _pc = pc(input)?;
+    aeat_whitespace(input)?;
+    let _acc = word(input)?;
+    aeat_whitespace(input)?;
+
+    let mut instr_mix = String::new();
+    let mut instr_map: HashMap<u8, usize> = HashMap::new();
+    let mut number_of_instructions = 0;
+    while !input.is_empty() {
+        let _addr = addr(input)?;
+        aeat_whitespace(input)?;
+        let instr = word(input)?;
+        aeat_whitespace(input)?;
+        number_of_instructions += 1;
+
+        *instr_map
+            .entry((instr.into_inner() >> 8) as u8)
+            .or_default() += 1;
+    }
+
+    for (instr, count) in instr_map.into_iter() {
+        let mix = count as f32 / number_of_instructions as f32;
+        let instr = opcode_as_str(instr);
+        instr_mix.push_str(&format!("{}\t{:.2}%\n", instr, mix * 100.0));
+    }
+
+    Ok(MachineCodeStatistics {
+        instr_mix,
+        number_of_instructions,
+    })
+}
+
+/// Convert the high nibble of an instruction word into the instruction identifier.
+pub fn opcode_as_str(opcode: u8) -> &'static str {
+    match opcode {
+        Alu::ADD => "ADD",
+        Alu::SUB => "SUB",
+        Alu::AND => "AND",
+        Alu::OR => "OR",
+        PcMux::JMP => "JMP",
+        PcMux::JZ => "JZ",
+        PcMux::JN => "JN",
+        Mem::LOAD => "LOAD",
+        Mem::STORE => "STORE",
+        0b1111 => "HALT",
+        _ => "UNKNOWN",
+    }
 }
 
 #[cfg(test)]

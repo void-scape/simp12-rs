@@ -1,44 +1,49 @@
+#![allow(clippy::too_many_arguments)]
+
 use simp12_rs::{
     assembler,
     control::ControlFlags,
-    cpu::{self, Acc, Alu, Cpu, Cycles, DeExLatch, ExMemLatch, IfDeLatch, Mem, Pc, PcAdder, PcMux},
+    cpu::{
+        self, Acc, Alu, Cpu, Cycles, DeExLatch, ExMemLatch, IfDeLatch, InstrTrace, Mem, Pc,
+        PcAdder, PcMux, Stalls,
+    },
     param::{B, S, Signal},
-    word::{Word, word},
 };
 use std::cell::{Ref, RefMut};
 
 fn main() {
-    // let bytes = include_bytes!("mult2int.txt");
-    // let machine_code = assembler::memory_file(bytes.as_slice()).unwrap();
-    let str = include_str!("mult2int.asm");
-    let machine_code = assembler::assemble(str).unwrap();
+    let mut args = std::env::args();
+    let binary = args.next().unwrap();
+    let memfile = match args.next() {
+        Some(path) => std::fs::read(path).unwrap(),
+        None => {
+            println!("Usage: {binary} path/to/memFile");
+            std::process::exit(1);
+        }
+    };
+    let stats = &assembler::memory_file_statistics(&memfile).unwrap();
+    let machine_code = assembler::memory_file(&memfile).unwrap();
     let cpu = Cpu::new(machine_code);
 
-    // init both integers
-    let a = 4;
-    let b = 3;
-    {
-        let mut mem = cpu.memory.borrow_mut();
-        mem.write(0xFE, word(a));
-        mem.write(0xFD, word(b));
-    }
-
-    fn simulated_mult(a: Word, b: Word) -> Word {
-        let mut result = word(0);
-        for _ in 0..b.into_inner() {
-            result = result.wrapping_add(a);
-        }
-        result
-    }
-
     const HALT: u8 = 0b1111;
-    let check_halt = move |latch: Ref<IfDeLatch>, mut mem: RefMut<Mem>, cycles: Ref<Cycles>| {
+    let check_halt = move |latch: Ref<IfDeLatch>,
+                           mem: RefMut<Mem>,
+                           cycles: Ref<Cycles>,
+                           stalls: Ref<Stalls>,
+                           trace: Ref<InstrTrace>| {
         if latch.ir == HALT {
+            println!("### Execution Time in Cycles ###");
+            println!("{}", cycles.0);
+            println!("### Stalls Inserted ###");
+            println!("{}", stalls.0);
+            println!("### Instruction Mix ###");
+            println!("Instruction Count: {}", stats.number_of_instructions);
+            print!("{}", stats.instr_mix);
+            println!("### Instruction Trace ###");
+            println!("Total Executed Instructions: {}", trace.count);
+            print!("{}", trace.trace);
+            println!("### Memory ###");
             println!("{}", mem.pretty_fmt());
-            println!("Cycles: {}", cycles.0);
-            let result = mem.read(0xFF);
-            // make sure the program did what we want
-            assert_eq!(result, simulated_mult(word(a), word(b)));
             std::process::exit(0);
         }
     };
@@ -51,7 +56,7 @@ fn main() {
             pcmux,
             pc,
             acc,
-            (check_halt, debug, cpu::finish_cycle),
+            (check_halt, cpu::finish_cycle),
         ));
     }
 }
@@ -66,6 +71,7 @@ fn mem(
     exmeml: Ref<ExMemLatch>,
     pc: Ref<Pc>,
     acc: Ref<Acc>,
+    mut trace: RefMut<InstrTrace>,
 ) {
     *stall = Signal::Low;
 
@@ -94,6 +100,14 @@ fn mem(
         && !control.hazard(deexl.control)
         && !control.hazard(exmeml.control)
     {
+        if ifdel.ir != 0b1111 {
+            trace.count += 1;
+            trace.trace.push_str(&format!(
+                "{}\n",
+                assembler::opcode_as_str(word.high_nibble())
+            ));
+        }
+
         ifdel.buffered_write(move |ifdel| {
             ifdel.control = control & ControlFlags::DECODE_FLAGS;
             ifdel.ir = word.high_nibble();
@@ -159,6 +173,7 @@ fn pc(
     mut pcmux: RefMut<PcMux>,
     exmeml: Ref<ExMemLatch>,
     stall: S<Stall>,
+    mut stalls: RefMut<Stalls>,
 ) {
     let pcincr = pcadder.add_pc(pc.0);
     pcmux.pc_incr = pc.0;
@@ -174,6 +189,8 @@ fn pc(
         pc.buffered_write(move |pc| {
             pc.0 = next_pc;
         });
+    } else {
+        stalls.incr();
     }
 }
 
@@ -186,53 +203,5 @@ fn acc(mut acc: B<Acc>, exmeml: Ref<ExMemLatch>) {
         acc.buffered_write(move |acc| {
             acc.0 = new_acc;
         });
-    }
-}
-
-fn debug(
-    pc: Ref<Pc>,
-    acc: Ref<Acc>,
-    ifdel: Ref<IfDeLatch>,
-    deexl: Ref<DeExLatch>,
-    exmeml: Ref<ExMemLatch>,
-    mut mem: RefMut<Mem>,
-) {
-    println!("[PC] {:#08X}", pc.0);
-    println!("[AC] {:#08X}", acc.0.into_inner());
-    debug_ir("IF", mem.read(pc.0).high_nibble(), false);
-
-    if ifdel.control != ControlFlags::NONE {
-        debug_ir("IF/DE", ifdel.ir, ifdel.control == ControlFlags::NONE);
-        println!("{:#?}", &*ifdel);
-    }
-    if deexl.control != ControlFlags::NONE {
-        debug_ir("DE/EX", deexl.ir, deexl.control == ControlFlags::NONE);
-        println!("{:#?}", &*deexl);
-    }
-    if exmeml.control != ControlFlags::NONE {
-        debug_ir("EX/MEM", exmeml.ir, exmeml.control == ControlFlags::NONE);
-        println!("{:#?}", &*exmeml);
-    }
-    println!();
-}
-
-fn debug_ir(stage: &'static str, ir: u8, stall: bool) {
-    if stall {
-        println!("[{stage}] STALL");
-    } else {
-        let instr_label = match ir {
-            PcMux::JMP => "JMP",
-            PcMux::JN => "JN",
-            PcMux::JZ => "JZ",
-            Alu::OR => "OR",
-            Alu::AND => "AND",
-            Alu::ADD => "ADD",
-            Alu::SUB => "SUB",
-            Mem::LOAD => "LOAD",
-            Mem::STORE => "STORE",
-            0b1111 => "HALT",
-            _ => "INVALID",
-        };
-        println!("[{stage}] {instr_label}");
     }
 }

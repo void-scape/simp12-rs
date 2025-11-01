@@ -42,6 +42,8 @@ cpu! {
     #[derive(Default)]
     pub struct Cpu {
         cycles: Cycles,
+        stalls: Stalls,
+        trace: InstrTrace,
         //
         signals: Signals,
         memory: Mem,
@@ -106,6 +108,23 @@ pub fn finish_cycle(cpu: &Cpu) {
     for mut command in cpu.commands.borrow_mut().drain(..) {
         command(cpu);
     }
+}
+
+/// Tracks the number of stalls inserted into the pipeline.
+#[derive(Debug, Default)]
+pub struct Stalls(pub usize);
+
+impl Stalls {
+    pub fn incr(&mut self) {
+        self.0 += 1;
+    }
+}
+
+/// Tracks the instructions executed by the pipeline.
+#[derive(Debug, Default)]
+pub struct InstrTrace {
+    pub trace: String,
+    pub count: usize,
 }
 
 /// Dynamic collection of [`Signal`]s associated with a type name.
