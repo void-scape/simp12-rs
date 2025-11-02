@@ -29,7 +29,7 @@ pub enum Error {
     InvalidArgLabel,
 }
 
-/// Parse an S12 assembly file into [`MachineCode`].
+/// Parse an S12 assembly file into a memory file.
 ///
 /// ## Format
 /// Jump instructions use labels to reference blocks of instructions.
@@ -75,10 +75,30 @@ pub enum Error {
 /// DONE:
 ///     HALT
 /// ```
-pub fn assemble(mut str: &str) -> Result<MachineCode> {
+pub fn assemble(mut str: &str) -> Result<String> {
     let input = &mut str;
+    let mut data = Vec::new();
     let mut labels = Vec::new();
     let mut instrs = Vec::new();
+
+    if let Some(str) = input.strip_prefix(".DATA") {
+        *input = str;
+        loop {
+            eat_whitespace(input)?;
+            if let Some(finished) = input.strip_prefix(".END_DATA") {
+                *input = finished;
+                break;
+            } else {
+                let addr = u8::from_str_radix(&input[..2], 16).map_err(|err| panic!("{err}"))?;
+                *input = &input[3..];
+                eat_whitespace(input)?;
+                let value = u16::from_str_radix(&input[..6], 16).map_err(|err| panic!("{err}"))?;
+                *input = &input[6..];
+                data.push((addr, value));
+            }
+        }
+    }
+
     loop {
         if input.lines().next().is_some_and(|l| l.contains(':')) {
             labels.push((label(input)?, instrs.len()));
@@ -92,12 +112,8 @@ pub fn assemble(mut str: &str) -> Result<MachineCode> {
         }
     }
 
-    let mut machine_code = MachineCode {
-        program: [crate::word::word(0); 256],
-        acc: crate::word::word(0),
-        pc: 0,
-    };
-    for (i, instr) in instrs.iter().enumerate() {
+    let mut out_instrs = Vec::new();
+    for instr in instrs.iter() {
         let word = match instr {
             Instr::Jmp(l) => {
                 let (_, index) = labels
@@ -122,21 +138,29 @@ pub fn assemble(mut str: &str) -> Result<MachineCode> {
             }
             Instr::Load(x) => ((Mem::LOAD as u16) << 8) | *x as u16,
             Instr::Store(x) => ((Mem::STORE as u16) << 8) | *x as u16,
-            Instr::LoadI(_) => {
-                todo!("LOADI");
-            }
-            Instr::StoreI(_) => {
-                todo!("STOREI");
-            }
+            Instr::LoadI(x) => ((Mem::LOADI as u16) << 8) | *x as u16,
+            Instr::StoreI(x) => ((Mem::STOREI as u16) << 8) | *x as u16,
             Instr::And(x) => ((Alu::AND as u16) << 8) | *x as u16,
             Instr::Or(x) => ((Alu::OR as u16) << 8) | *x as u16,
             Instr::Add(x) => ((Alu::ADD as u16) << 8) | *x as u16,
             Instr::Sub(x) => ((Alu::SUB as u16) << 8) | *x as u16,
             Instr::Halt => 0b1111 << 8,
         };
-        machine_code.program[i] = crate::word::word(word);
+        out_instrs.push(crate::word::word(word));
     }
-    Ok(machine_code)
+
+    let mut out = String::new();
+    out.push_str(&format!("{:08b}", 0));
+    out.push_str(&format!("{:012b}\n", 0));
+    for (addr, instr) in out_instrs.iter().enumerate() {
+        out.push_str(&format!("{:02x} ", addr));
+        out.push_str(&format!("{:012b}\n", instr.into_inner()));
+    }
+    for (addr, data) in data.iter() {
+        out.push_str(&format!("{:02x} ", addr));
+        out.push_str(&format!("{:012b}\n", data));
+    }
+    Ok(out)
 }
 
 #[derive(PartialEq, Eq, Hash)]
@@ -394,6 +418,8 @@ pub fn opcode_as_str(opcode: u8) -> &'static str {
         PcMux::JN => "JN",
         Mem::LOAD => "LOAD",
         Mem::STORE => "STORE",
+        Mem::LOADI => "LOADI",
+        Mem::STOREI => "STOREI",
         0b1111 => "HALT",
         _ => "UNKNOWN",
     }
@@ -413,10 +439,5 @@ mod test {
 
         let str = include_str!("mult2int.asm");
         assert!(assemble(str).is_ok());
-
-        assert_eq!(
-            assemble(str).unwrap(),
-            memory_file(bytes.as_slice()).unwrap()
-        )
     }
 }

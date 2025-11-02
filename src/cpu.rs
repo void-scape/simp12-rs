@@ -144,6 +144,8 @@ impl Default for Mem {
 impl Mem {
     pub const LOAD: u8 = 0b0100;
     pub const STORE: u8 = 0b0101;
+    pub const LOADI: u8 = 0b0110;
+    pub const STOREI: u8 = 0b0111;
 
     /// Read a [`Word`] from `addr`.
     pub fn read(&mut self, addr: u8) -> Word {
@@ -159,7 +161,7 @@ impl Mem {
     pub fn pretty_fmt(&self) -> String {
         let mut str = String::new();
         for (i, slice) in self.0.chunks(4).enumerate() {
-            str.push_str(&format!("{:#06X}\t", i));
+            str.push_str(&format!("{:#06X}\t", i * 4));
             for word in slice.iter() {
                 str.push_str(&format!("{:#08X} ", word.into_inner()));
             }
@@ -265,6 +267,7 @@ pub struct ExMemLatch {
     pub ir: u8,
     pub mar: u8,
     pub mdr: Word,
+    pub mddr: Word,
     pub alu_result: Word,
     pub control: ControlFlags,
 }
@@ -275,6 +278,7 @@ impl Default for ExMemLatch {
             ir: INIT_IR,
             mar: 0,
             mdr: word(0),
+            mddr: word(0),
             alu_result: word(0),
             control: ControlFlags::NONE,
         }
